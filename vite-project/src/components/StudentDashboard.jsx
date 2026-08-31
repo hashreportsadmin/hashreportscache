@@ -6,20 +6,53 @@ import { Welcome } from './Welcome';
 import { calculateOrderProgress, dbCreateObject, dbListMinimalByField, dbListObjects, dbListObjectsByField, dbUpdateObject } from '../utils/db';
 import { formatPhone } from '../utils/formatters';
 
+// --- Dashboard order/logbook cache ---------------------------------------
+// The "Your Order in Progress" percentage bar (and every step status on the
+// tracking screen, since it's all derived from this same order data) is
+// cached permanently in localStorage per student. That means it renders
+// instantly from cache - no waiting on the database - and survives signing
+// out or closing the browser, exactly like the Upload Logbook tracker does.
+const DASH_ORDERS_CACHE_PREFIX = 'cached_dashboard_orders_';
+const DASH_LOGBOOKS_CACHE_PREFIX = 'cached_dashboard_logbooks_';
+
+const readDashCache = (prefix, key) => {
+    if (!key) return null;
+    try {
+        const raw = localStorage.getItem(`${prefix}${key}`);
+        return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+        return null;
+    }
+};
+
+const writeDashCache = (prefix, key, value) => {
+    if (!key) return;
+    try {
+        localStorage.setItem(`${prefix}${key}`, JSON.stringify(value));
+    } catch (e) {}
+};
+
+// An order's progress is "final" once its report has been delivered -
+// nothing about its percentage or step statuses can change after that
+// (mirrors how the Admin and tracking screens already treat reportPdfUrl
+// as the completed state).
+const isOrderFinal = (order) => !!order?.objectData?.reportPdfUrl;
+const areAllOrdersFinal = (orders) => Array.isArray(orders) && orders.length > 0 && orders.every(isOrderFinal);
+
 const StudentDashboard = ({ onLogout }) => {
     const user = JSON.parse(localStorage.getItem('currentUser')) || { fullName: 'Student User' };
     const firstName = user.fullName ? user.fullName.split(' ')[0] : 'Student';
     const [orderFlowKey, setOrderFlowKey] = React.useState(0);
     const [showOrderFlow, setShowOrderFlow] = React.useState(false);
-    const [userOrders, setUserOrders] = React.useState([]);
-    const [isFetching, setIsFetching] = React.useState(true);
+    const [userOrders, setUserOrders] = React.useState(() => readDashCache(DASH_ORDERS_CACHE_PREFIX, user?.regNumber) || []);
+    const [isFetching, setIsFetching] = React.useState(() => !readDashCache(DASH_ORDERS_CACHE_PREFIX, user?.regNumber));
     const [viewingOrderId, setViewingOrderId] = React.useState(null);
     const [allPaidOrders, setAllPaidOrders] = React.useState([]);
     const [showPaymentPopup, setShowPaymentPopup] = React.useState(false);
     const [editingPayment, setEditingPayment] = React.useState(false);
     const [editPaymentData, setEditPaymentData] = React.useState({ phone: '', name: '' });
     const [copied, setCopied] = React.useState(false);
-    const [logbooks, setLogbooks] = React.useState([]);
+    const [logbooks, setLogbooks] = React.useState(() => readDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user?.regNumber) || []);
     const [trackingKey, setTrackingKey] = React.useState(0);
 
     // New states for screens and popups
@@ -48,9 +81,34 @@ const StudentDashboard = ({ onLogout }) => {
         setTimeout(() => setCopied(false), 2000);
     };
 
+    // Keep refs of the latest orders/logbooks so the poll below can check
+    // whether everything is already final without needing to be recreated
+    // every time state updates.
+    const ordersRef = React.useRef(userOrders);
+    React.useEffect(() => { ordersRef.current = userOrders; }, [userOrders]);
+    const logbooksRef = React.useRef(logbooks);
+    React.useEffect(() => { logbooksRef.current = logbooks; }, [logbooks]);
+
+    // Wraps setUserOrders so every local/optimistic change (cancelling an
+    // order, placing a new one, editing payment details, etc.) also updates
+    // the permanent cache immediately - not just the background poll.
+    const updateUserOrders = (updater) => {
+        setUserOrders(prev => {
+            const next = typeof updater === 'function' ? updater(prev) : updater;
+            writeDashCache(DASH_ORDERS_CACHE_PREFIX, user.regNumber, next);
+            return next;
+        });
+    };
+
     React.useEffect(() => {
         let isMounted = true;
-        const fetchOrders = async () => {
+
+        const fetchOrdersAndLogbooks = async () => {
+            // Once every order's report has been delivered, none of its
+            // progress data can change anymore - skip the database call
+            // entirely and keep serving the permanent cache. This is what
+            // makes the percentage bar instant on a later sign-in.
+            if (areAllOrdersFinal(ordersRef.current)) return;
             try {
                 const [myOrdersRes, paidRes] = await Promise.all([
                     dbListObjectsByField('field_report_order', 'regNumber', user.regNumber, 1000, true),
@@ -61,6 +119,7 @@ const StudentDashboard = ({ onLogout }) => {
                     setAllPaidOrders(paidRes.items);
                     setUserOrders(prev => {
                         if (JSON.stringify(prev) !== JSON.stringify(myOrders)) {
+                            writeDashCache(DASH_ORDERS_CACHE_PREFIX, user.regNumber, myOrders);
                             return myOrders;
                         }
                         return prev;
@@ -72,6 +131,21 @@ const StudentDashboard = ({ onLogout }) => {
             }
 
             try {
+                const logsRes = await dbListObjectsByField('logbook', 'regNumber', user.regNumber, 1000, true);
+                if (isMounted) {
+                    setLogbooks(prev => {
+                        if (JSON.stringify(prev) !== JSON.stringify(logsRes.items)) {
+                            writeDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user.regNumber, logsRes.items);
+                            return logsRes.items;
+                        }
+                        return prev;
+                    });
+                }
+            } catch (e) {}
+        };
+
+        const fetchNotifications = async () => {
+            try {
                 const notifRes = await dbListObjectsByField('notification', 'regNumber', user.regNumber, 100, true);
                 if (isMounted) {
                     setNotifications(notifRes.items);
@@ -79,17 +153,21 @@ const StudentDashboard = ({ onLogout }) => {
             } catch (e) {
                 console.error("Failed to fetch notifications", e);
             }
-            try {
-                const logsRes = await dbListObjectsByField('logbook', 'regNumber', user.regNumber, 1000, true);
-                if (isMounted) {
-                    setLogbooks(logsRes.items);
-                }
-            } catch (e) {}
+        };
+
+        const pollTick = async () => {
+            await fetchOrdersAndLogbooks();
+            await fetchNotifications();
         };
         
         if (user && user.regNumber) {
-            fetchOrders();
-            const intervalId = setInterval(fetchOrders, 5000);
+            if (areAllOrdersFinal(ordersRef.current)) {
+                // Fully finished already - the permanent cache is
+                // trustworthy on its own, no need to wait on anything.
+                setIsFetching(false);
+            }
+            pollTick();
+            const intervalId = setInterval(pollTick, 5000);
             return () => {
                 isMounted = false;
                 clearInterval(intervalId);
@@ -152,7 +230,7 @@ const StudentDashboard = ({ onLogout }) => {
                             ...userOrders[0].objectData,
                             status: 'CANCELLED'
                         });
-                        setUserOrders(prev => prev.filter(o => o.objectId !== userOrders[0].objectId));
+                        updateUserOrders(prev => prev.filter(o => o.objectId !== userOrders[0].objectId));
                         setOrderFlowKey(prev => prev + 1);
                         pushInnerScreenState();
                         setShowOrderFlow(true);
@@ -197,7 +275,7 @@ const StudentDashboard = ({ onLogout }) => {
                             isRead: false,
                             icon: 'circle-x'
                         });
-                        setUserOrders(prev => prev.filter(o => o.objectId !== orderId));
+                        updateUserOrders(prev => prev.filter(o => o.objectId !== orderId));
                     }
                 } catch (e) {
                     console.error(e);
@@ -1164,7 +1242,7 @@ const StudentDashboard = ({ onLogout }) => {
                 onClose={() => window.history.back()} 
                 user={user} 
                 onOrderPlaced={(newOrder) => {
-                    setUserOrders(prev => [newOrder, ...prev]);
+                    updateUserOrders(prev => [newOrder, ...prev]);
                     setShowOrderFlow(false);
                     pushInnerScreenState();
                     setShowPaymentPopup(true);
@@ -1230,7 +1308,7 @@ const StudentDashboard = ({ onLogout }) => {
                                                         paymentName: editPaymentData.name
                                                     });
                                                     const updated = {...orderToUpdate, objectData: {...orderToUpdate.objectData, paymentPhone: editPaymentData.phone, paymentName: editPaymentData.name}};
-                                                    setUserOrders(prev => prev.map(o => o.objectId === orderToUpdate.objectId ? updated : o));
+                                                    updateUserOrders(prev => prev.map(o => o.objectId === orderToUpdate.objectId ? updated : o));
                                                     setEditingPayment(false);
                                                 } catch(e) {
                                                     console.error("Failed to update payment details", e);

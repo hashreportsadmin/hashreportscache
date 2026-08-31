@@ -3,6 +3,59 @@ import { Popup } from './SharedUI';
 import { Welcome } from './Welcome';
 import { calculateOrderProgress, dbCreateObject, dbDeleteObject, dbListObjects, dbUpdateObject } from '../utils/db';
 
+// --- Admin panel permanent cache ------------------------------------------
+// Every collection the admin panel uses is cached in localStorage. That
+// means switching between nav tabs (Dashboard, Pending Orders, Logbooks,
+// etc.) never re-fetches from the database - they all just read from the
+// same already-loaded, already-cached state. The cache also survives
+// signing out and closing the browser: on the next visit the panel renders
+// straight from the cached copy instead of waiting on a database call. A
+// single lightweight background sync (not tied to tab navigation) keeps
+// checking the database and updates the cache + screen the instant
+// something actually changes; when nothing has changed it doesn't touch
+// state at all, so it behaves exactly like a pure cache read.
+const ADMIN_CACHE_KEYS = {
+    users: 'admin_cache_users',
+    passwordRequests: 'admin_cache_password_requests',
+    fieldOrders: 'admin_cache_field_orders',
+    logbooks: 'admin_cache_logbooks'
+};
+
+const readAdminCache = (key) => {
+    try {
+        const raw = localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+        return null;
+    }
+};
+
+const writeAdminCache = (key, value) => {
+    try {
+        localStorage.setItem(key, JSON.stringify(value));
+    } catch (e) {}
+};
+
+// A drop-in replacement for React.useState that transparently persists
+// every update to localStorage under `cacheKey`, and seeds its initial
+// value from that cache. Every existing setUsers/setFieldOrders/etc. call
+// site keeps working unchanged - it now just also writes through to the
+// permanent cache automatically.
+const useCachedState = (cacheKey, initialValue) => {
+    const [state, setState] = React.useState(() => {
+        const cached = readAdminCache(cacheKey);
+        return cached !== null ? cached : initialValue;
+    });
+    const setCachedState = React.useCallback((updater) => {
+        setState(prev => {
+            const next = typeof updater === 'function' ? updater(prev) : updater;
+            writeAdminCache(cacheKey, next);
+            return next;
+        });
+    }, [cacheKey]);
+    return [state, setCachedState];
+};
+
 const getAdminStepIcon = (title) => {
     if(title.includes('Logbook')) return 'book';
     if(title.includes('Supervisors')) return 'users';
@@ -44,11 +97,16 @@ const AdminDashboard = ({ onLogout }) => {
     const adminAuthority = localStorage.getItem('adminAuthority') || "Chief Executive Officer";
     const [activeTab, setActiveTab] = React.useState('Dashboard');
     const [searchQuery, setSearchQuery] = React.useState('');
-    const [users, setUsers] = React.useState([]);
-    const [allPaidOrders, setAllPaidOrders] = React.useState([]);
-    const [passwordRequests, setPasswordRequests] = React.useState([]);
-    const [fieldOrders, setFieldOrders] = React.useState([]);
-    const [logbooks, setLogbooks] = React.useState([]);
+    const [users, setUsers] = useCachedState(ADMIN_CACHE_KEYS.users, []);
+    const [allPaidOrders, setAllPaidOrders] = React.useState(() => {
+        const cachedOrders = readAdminCache(ADMIN_CACHE_KEYS.fieldOrders) || [];
+        return cachedOrders
+            .filter(o => o.objectData.status === 'PAID')
+            .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+    });
+    const [passwordRequests, setPasswordRequests] = useCachedState(ADMIN_CACHE_KEYS.passwordRequests, []);
+    const [fieldOrders, setFieldOrders] = useCachedState(ADMIN_CACHE_KEYS.fieldOrders, []);
+    const [logbooks, setLogbooks] = useCachedState(ADMIN_CACHE_KEYS.logbooks, []);
     const [showPopup, setShowPopup] = React.useState(false);
     const [userToDelete, setUserToDelete] = React.useState(null);
     const [visiblePasswords, setVisiblePasswords] = React.useState({});
@@ -65,6 +123,7 @@ const AdminDashboard = ({ onLogout }) => {
     const [digitizingState, setDigitizingState] = React.useState({});
     const [authPopupMsg, setAuthPopupMsg] = React.useState(null);
     const [selectedUserForDetails, setSelectedUserForDetails] = React.useState(null);
+    const [selectedFieldOrderForDetails, setSelectedFieldOrderForDetails] = React.useState(null);
     const [selectedOrderForSupervisors, setSelectedOrderForSupervisors] = React.useState(null);
     const [isMobileMenuOpen, setIsMobileMenuOpen] = React.useState(false);
 
@@ -110,19 +169,23 @@ const AdminDashboard = ({ onLogout }) => {
             const sortByDateDesc = (items) => [...items].sort((a,b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
             
             const userRes = await dbListObjects('user', 1000, false);
-            setUsers(sortByDateDesc(userRes.items));
+            const sortedUsers = sortByDateDesc(userRes.items);
+            setUsers(prev => JSON.stringify(prev) !== JSON.stringify(sortedUsers) ? sortedUsers : prev);
             
             const reqsRes = await dbListObjects('password_request', 1000, false);
-            setPasswordRequests(sortByDateDesc(reqsRes.items));
+            const sortedReqs = sortByDateDesc(reqsRes.items);
+            setPasswordRequests(prev => JSON.stringify(prev) !== JSON.stringify(sortedReqs) ? sortedReqs : prev);
 
             const ordersRes = await dbListObjects('field_report_order', 1000, false);
-            setFieldOrders(sortByDateDesc(ordersRes.items));
+            const sortedOrders = sortByDateDesc(ordersRes.items);
+            setFieldOrders(prev => JSON.stringify(prev) !== JSON.stringify(sortedOrders) ? sortedOrders : prev);
             
             const paid = ordersRes.items.filter(o => o.objectData.status === 'PAID').sort((a,b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
-            setAllPaidOrders(paid);
+            setAllPaidOrders(prev => JSON.stringify(prev) !== JSON.stringify(paid) ? paid : prev);
 
             const logsRes = await dbListObjects('logbook', 1000, false);
-            setLogbooks(sortByDateDesc(logsRes.items));
+            const sortedLogs = sortByDateDesc(logsRes.items);
+            setLogbooks(prev => JSON.stringify(prev) !== JSON.stringify(sortedLogs) ? sortedLogs : prev);
         } catch (e) {
             console.error("Failed to load DB data", e);
         }
@@ -145,8 +208,19 @@ const AdminDashboard = ({ onLogout }) => {
     };
 
     React.useEffect(() => {
+        let isMounted = true;
+        // Runs once on mount (not on every tab click) so navigating between
+        // Dashboard / Pending Orders / Logbooks / etc. is always served from
+        // the already-loaded, cached state - no per-tab database fetch.
         loadData();
-    }, [activeTab]);
+        const intervalId = setInterval(() => {
+            if (isMounted) loadData();
+        }, 5000);
+        return () => {
+            isMounted = false;
+            clearInterval(intervalId);
+        };
+    }, []);
 
     React.useEffect(() => {
         setSearchQuery('');
@@ -173,14 +247,32 @@ const AdminDashboard = ({ onLogout }) => {
             const unpaidOrders = activeFieldOrders.filter(o => o.objectData.status === 'UNPAID' && o.objectData.status !== 'CANCELLED').length;
             const cancelledOrders = activeFieldOrders.filter(o => o.objectData.status === 'CANCELLED').length;
 
+            // Real last-8-months buckets (ending this month) for the Orders
+            // and Revenue charts below, instead of the previous hardcoded
+            // placeholder numbers - each bucket counts actual orders whose
+            // createdAt falls in that month.
+            const now = new Date();
+            const monthBuckets = Array.from({ length: 8 }, (_, i) => {
+                const d = new Date(now.getFullYear(), now.getMonth() - (7 - i), 1);
+                return { label: d.toLocaleString('default', { month: 'short' }), year: d.getFullYear(), month: d.getMonth() };
+            });
+            const ordersByMonth = monthBuckets.map(b => activeFieldOrders.filter(o => {
+                const d = new Date(o.createdAt);
+                return d.getFullYear() === b.year && d.getMonth() === b.month;
+            }).length);
+            const revenueByMonth = monthBuckets.map(b => paidOrders.filter(o => {
+                const d = new Date(o.createdAt);
+                return d.getFullYear() === b.year && d.getMonth() === b.month;
+            }).length * 15000);
+
             if (chartRef.current) {
                 chartInstanceRef.current = new window.Chart(chartRef.current, {
                     type: 'bar',
                     data: {
-                        labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug'],
+                        labels: monthBuckets.map(b => b.label),
                         datasets: [{
                             label: 'Orders',
-                            data: [12, 19, 15, 25, 22, 30, 45, activeFieldOrders.length],
+                            data: ordersByMonth,
                             backgroundColor: '#0077be',
                             borderRadius: 4
                         }]
@@ -221,10 +313,10 @@ const AdminDashboard = ({ onLogout }) => {
                 revenueInstanceRef.current = new window.Chart(revenueChartRef.current, {
                     type: 'line',
                     data: {
-                        labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug'],
+                        labels: monthBuckets.map(b => b.label),
                         datasets: [{
                             label: 'Revenue (TZS)',
-                            data: [150000, 350000, 250000, 450000, 300000, 500000, 600000, paidOrders.length * 15000],
+                            data: revenueByMonth,
                             borderColor: '#10b981',
                             backgroundColor: 'rgba(16, 185, 129, 0.1)',
                             borderWidth: 2,
@@ -286,8 +378,8 @@ const AdminDashboard = ({ onLogout }) => {
                         labels: ['Field Report', 'Research Report'],
                         datasets: [{
                             data: [
-                                activeFieldOrders.filter(o => o.objectData.reportType === 'Field Report').length || 1,
-                                activeFieldOrders.filter(o => o.objectData.reportType === 'Research Report').length || 0
+                                activeFieldOrders.filter(o => o.objectData.reportType === 'Field Report').length,
+                                activeFieldOrders.filter(o => o.objectData.reportType === 'Research Report').length
                             ],
                             backgroundColor: ['#3b82f6', '#8b5cf6'],
                             borderWidth: 0
@@ -302,13 +394,27 @@ const AdminDashboard = ({ onLogout }) => {
             }
 
             if (activityChartRef.current) {
+                // Real, derived metrics instead of hardcoded placeholder
+                // numbers - each is a percentage of activeFieldOrders so
+                // all five axes sit on a comparable 0-100 scale.
+                const totalOrdersForActivity = activeFieldOrders.length || 1;
+                const totalLogbookSlots = activeFieldOrders.length * 6 || 1;
+                const digitizedLogbookCount = logbooks.filter(l => l.objectData.logbookStatus === 'digitized').length;
+                const uploadsPct = Math.round((digitizedLogbookCount / totalLogbookSlots) * 100);
+                const editsCount = activeFieldOrders.filter(o => o.objectData.internalSupervisorChanged || o.objectData.externalSupervisorChanged).length;
+                const editsPct = Math.round((editsCount / totalOrdersForActivity) * 100);
+                const settledPct = Math.round((settledOrders / totalOrdersForActivity) * 100);
+                const paymentsPct = Math.round((paidOrders.length / totalOrdersForActivity) * 100);
+                const downloadsCount = activeFieldOrders.filter(o => o.objectData.reportPdfUrl).length;
+                const downloadsPct = Math.round((downloadsCount / totalOrdersForActivity) * 100);
+
                 activityInstanceRef.current = new window.Chart(activityChartRef.current, {
                     type: 'radar',
                     data: {
-                        labels: ['Uploads', 'Edits', 'Logins', 'Payments', 'Downloads'],
+                        labels: ['Logbook Uploads', 'Supervisor Edits', 'Settled', 'Payments', 'Report Downloads'],
                         datasets: [{
-                            label: 'User Activity',
-                            data: [65, 59, 90, 81, 56],
+                            label: 'Order Activity (%)',
+                            data: [uploadsPct, editsPct, settledPct, paymentsPct, downloadsPct],
                             backgroundColor: 'rgba(236, 72, 153, 0.2)',
                             borderColor: 'rgba(236, 72, 153, 1)',
                             pointBackgroundColor: 'rgba(236, 72, 153, 1)',
@@ -318,7 +424,7 @@ const AdminDashboard = ({ onLogout }) => {
                         responsive: true,
                         maintainAspectRatio: false,
                         plugins: { legend: { display: false } },
-                        scales: { r: { ticks: { display: false } } }
+                        scales: { r: { beginAtZero: true, max: 100, ticks: { display: false } } }
                     }
                 });
             }
@@ -331,7 +437,7 @@ const AdminDashboard = ({ onLogout }) => {
             if (typeInstanceRef.current) typeInstanceRef.current.destroy();
             if (activityInstanceRef.current) activityInstanceRef.current.destroy();
         };
-    }, [activeTab, fieldOrders]);
+    }, [activeTab, fieldOrders, users, logbooks]);
 
     const togglePasswordVisibility = (id) => {
         if (!checkAuth('view_password')) return;
@@ -1356,7 +1462,7 @@ const AdminDashboard = ({ onLogout }) => {
                                                 </tr>
                                             ) : (
                                                 applySearch(getOrdersWithUserDetails(o => o.objectData.status !== 'CANCELLED'), o => [o.userDetails.objectData?.fullName, o.objectData.regNumber, o.objectData.organizationName, o.objectData.paymentPhone, o.objectData.paymentName]).map((order, i) => (
-                                                    <tr key={i} className="hover:bg-blue-50/50 transition-colors">
+                                                    <tr key={i} className="hover:bg-blue-50/50 transition-colors cursor-pointer" onClick={() => setSelectedFieldOrderForDetails(order)}>
                                                         <td className="px-3 py-2">
                                                             <div className="w-8 h-8 rounded-full overflow-hidden border border-gray-200 shadow-sm bg-gray-100">
                                                                 {order.userDetails.objectData?.photoUrl ? <img src={order.userDetails.objectData.photoUrl} alt="profile" className="w-full h-full object-cover" /> : <div className="icon-user text-gray-400 w-full h-full flex items-center justify-center"></div>}
@@ -1373,7 +1479,7 @@ const AdminDashboard = ({ onLogout }) => {
                                                                 <span className="text-[9px] text-gray-500 truncate max-w-[100px]">{order.objectData.paymentName}</span>
                                                             </div>
                                                         </td>
-                                                        <td className="px-3 py-2 text-center">
+                                                        <td className="px-3 py-2 text-center" onClick={(e) => e.stopPropagation()}>
                                                             <div className="flex items-center justify-center gap-2">
                                                                 <button 
                                                                     onClick={() => handleToggleOrderStatus(order)}
@@ -1773,7 +1879,66 @@ const AdminDashboard = ({ onLogout }) => {
                     confirmText="OKAY"
                 />
 
-                {/* User Detail Modal */}
+                {/* Field Report Order Details Modal */}
+                {selectedFieldOrderForDetails && (
+                    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[110] flex items-center justify-center p-4">
+                        <div className="bg-white w-full max-w-lg rounded-2xl flex flex-col overflow-hidden animate-fade-in-up shadow-2xl border border-gray-200 max-h-[90vh]">
+                            <div className="bg-gradient-to-r from-[var(--primary-dark)] to-[var(--primary-color)] p-6 relative shrink-0">
+                                <button onClick={() => setSelectedFieldOrderForDetails(null)} className="absolute top-4 right-4 text-white/80 hover:text-white bg-black/10 hover:bg-black/20 p-1.5 rounded-full transition-colors">
+                                    <div className="icon-x text-lg"></div>
+                                </button>
+                                <div className="flex items-center gap-4">
+                                    <div className="w-20 h-20 rounded-full border-4 border-white/20 overflow-hidden bg-white/10 shrink-0">
+                                        {selectedFieldOrderForDetails.userDetails.objectData?.photoUrl ? (
+                                            <img src={selectedFieldOrderForDetails.userDetails.objectData.photoUrl} alt="profile" className="w-full h-full object-cover" />
+                                        ) : (
+                                            <div className="icon-user text-white text-3xl w-full h-full flex items-center justify-center"></div>
+                                        )}
+                                    </div>
+                                    <div className="text-white min-w-0">
+                                        <h3 className="text-xl font-bold truncate">{selectedFieldOrderForDetails.userDetails.objectData?.fullName || 'Unknown'}</h3>
+                                        <p className="text-blue-100 font-mono text-sm">{selectedFieldOrderForDetails.objectData.regNumber}</p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="p-6 bg-gray-50 flex-1 overflow-y-auto space-y-4">
+                                <div className="bg-white p-4 rounded-xl border border-gray-100 shadow-sm space-y-3">
+                                    <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Order Info</h4>
+                                    <div className="flex justify-between items-start border-b border-gray-50 pb-2">
+                                        <span className="text-gray-500 text-sm shrink-0">Organization</span>
+                                        <span className="font-semibold text-gray-900 text-sm text-right max-w-[65%]">{selectedFieldOrderForDetails.objectData.organizationName}</span>
+                                    </div>
+                                    <div className="flex justify-between items-start border-b border-gray-50 pb-2">
+                                        <span className="text-gray-500 text-sm shrink-0">Location</span>
+                                        <span className="font-semibold text-gray-900 text-sm text-right max-w-[65%]">{selectedFieldOrderForDetails.objectData.region}, {selectedFieldOrderForDetails.objectData.district}</span>
+                                    </div>
+                                    <div className="flex justify-between items-start">
+                                        <span className="text-gray-500 text-sm shrink-0">Duration</span>
+                                        <span className="font-semibold text-gray-900 text-sm text-right">{selectedFieldOrderForDetails.objectData.startDate} — {selectedFieldOrderForDetails.objectData.endDate}</span>
+                                    </div>
+                                </div>
+                                <div className="bg-white p-4 rounded-xl border border-gray-100 shadow-sm space-y-3">
+                                    <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Payment Info</h4>
+                                    <div className="flex justify-between items-center border-b border-gray-50 pb-2">
+                                        <span className="text-gray-500 text-sm">Phone</span>
+                                        <span className="font-mono font-semibold text-gray-900 text-sm">{selectedFieldOrderForDetails.objectData.paymentPhone}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center">
+                                        <span className="text-gray-500 text-sm">Name</span>
+                                        <span className="font-semibold text-gray-900 text-sm text-right">{selectedFieldOrderForDetails.objectData.paymentName}</span>
+                                    </div>
+                                </div>
+                                <div className="bg-white p-4 rounded-xl border border-gray-100 shadow-sm flex justify-between items-center">
+                                    <span className="text-gray-500 text-sm">Order Status</span>
+                                    <span className={`px-2.5 py-1 rounded-lg text-xs font-bold ${selectedFieldOrderForDetails.objectData.status === 'PAID' ? 'bg-green-50 text-green-600' : 'bg-orange-50 text-orange-600'}`}>
+                                        {selectedFieldOrderForDetails.objectData.status === 'PAID' ? getOrderNumber(selectedFieldOrderForDetails) : selectedFieldOrderForDetails.objectData.status}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
                 {selectedUserForDetails && (
                     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[110] flex items-center justify-center p-4">
                         <div className="bg-white w-full max-w-lg rounded-2xl flex flex-col overflow-hidden animate-fade-in-up shadow-2xl border border-gray-200">
