@@ -74,6 +74,39 @@ const areLogbooksComplete = (logs, weekLabels) => {
     });
 };
 
+// Logbooks are only re-synced with the database once per calendar week -
+// specifically on the first login of each Saturday. Every other day (and
+// every other login on that same Saturday) is served purely from the
+// permanent cache, with no database call at all.
+const LOGBOOK_SYNC_DATE_PREFIX = 'logbook_last_sync_';
+
+const readLastSyncDate = (orderId) => {
+    if (!orderId) return null;
+    try {
+        return localStorage.getItem(`${LOGBOOK_SYNC_DATE_PREFIX}${orderId}`);
+    } catch (e) {
+        return null;
+    }
+};
+
+const writeLastSyncDate = (orderId, dateStr) => {
+    if (!orderId) return;
+    try {
+        localStorage.setItem(`${LOGBOOK_SYNC_DATE_PREFIX}${orderId}`, dateStr);
+    } catch (e) {}
+};
+
+// A fresh database sync is only due when there's no cached data yet at all
+// (first-ever view), or when today is Saturday and this order hasn't
+// already been synced today (i.e. this is the first login this Saturday).
+const isWeeklySyncDue = (orderId, hasCache) => {
+    if (!hasCache) return true;
+    const isSaturday = new Date().getDay() === 6; // 0=Sun ... 6=Sat
+    if (!isSaturday) return false;
+    const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    return readLastSyncDate(orderId) !== todayStr;
+};
+
 const OrderProgress = ({ order, user, onBack, getOrderNumber, onPayClick, initialExpandedStep = null, skipAnimations = false }) => {
     const [expandedStep, setExpandedStep] = React.useState(initialExpandedStep);
     const [downloadState, setDownloadState] = React.useState('idle');
@@ -232,13 +265,13 @@ const OrderProgress = ({ order, user, onBack, getOrderNumber, onPayClick, initia
 
     React.useEffect(() => {
         let isMounted = true;
+        let intervalId = null;
         const weekLabels = orderProgressStepsData[0].subSteps;
 
         const fetchLogbooks = async () => {
             // Once every week is already digitized, nothing about this
             // order's logbooks can change anymore - skip the database call
-            // entirely and keep serving the permanent cache. This is what
-            // makes a later sign-in instant instead of re-fetching.
+            // entirely and keep serving the permanent cache.
             if (areLogbooksComplete(logbooksRef.current, weekLabels)) return;
             try {
                 const res = await dbListObjectsByField('logbook', 'orderId', order.objectId, 10, true);
@@ -247,6 +280,7 @@ const OrderProgress = ({ order, user, onBack, getOrderNumber, onPayClick, initia
                 setLogbooks(myLogs);
                 writeLogbookCache(order.objectId, myLogs);
                 setInitialLoadDone(true);
+                writeLastSyncDate(order.objectId, new Date().toISOString().slice(0, 10));
             } catch (e) {
                 console.error("Failed to fetch logbooks", e);
             }
@@ -257,26 +291,27 @@ const OrderProgress = ({ order, user, onBack, getOrderNumber, onPayClick, initia
             logbooksRef.current = cached;
         }
 
-        if (areLogbooksComplete(cached, weekLabels)) {
-            // Fully finished already - the permanent cache is trustworthy on
-            // its own, so show it immediately with no network round trip.
+        const complete = areLogbooksComplete(cached, weekLabels);
+        const syncDue = !complete && isWeeklySyncDue(order.objectId, !!cached);
+
+        if (complete || !syncDue) {
+            // Either fully finished, or it's not this order's weekly sync
+            // day yet (or already synced once today) - trust the permanent
+            // cache and show it instantly with no network round trip.
             setInitialLoadDone(true);
         } else {
-            // Show whatever's cached instantly (already done via the state
-            // initializer above), then refresh once right away so this
-            // loads fast even the very first time.
+            // No cache yet, or today is the first Saturday login for this
+            // order - sync with the database once. While that sync is in
+            // progress, keep a light poll running so an in-progress week
+            // can pick up its "digitized" status live during this viewing
+            // session (it stops on its own the moment everything's final).
             fetchLogbooks();
+            intervalId = setInterval(fetchLogbooks, 3000);
         }
 
-        // Keep a light-weight timer running so in-progress weeks pick up
-        // their "digitized" status once ready. Each tick is a no-op (see
-        // the completeness check above) as soon as everything is final, so
-        // this doesn't keep hammering the database once there's nothing
-        // left to change.
-        const intervalId = setInterval(fetchLogbooks, 3000);
         return () => {
             isMounted = false;
-            clearInterval(intervalId);
+            if (intervalId) clearInterval(intervalId);
         };
     }, [order.objectId]);
     

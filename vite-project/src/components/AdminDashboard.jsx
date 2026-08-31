@@ -1,4 +1,5 @@
 import React from 'react';
+import Chart from 'chart.js/auto';
 import { Popup } from './SharedUI';
 import { Welcome } from './Welcome';
 import { calculateOrderProgress, dbCreateObject, dbDeleteObject, dbListObjects, dbUpdateObject } from '../utils/db';
@@ -228,7 +229,7 @@ const AdminDashboard = ({ onLogout }) => {
 
     // Initialize Charts on Dashboard Tab
     React.useEffect(() => {
-        if (activeTab === 'Dashboard' && typeof window.Chart !== 'undefined') {
+        if (activeTab === 'Dashboard') {
             if (chartInstanceRef.current) chartInstanceRef.current.destroy();
             if (doughnutInstanceRef.current) doughnutInstanceRef.current.destroy();
             if (revenueInstanceRef.current) revenueInstanceRef.current.destroy();
@@ -266,7 +267,7 @@ const AdminDashboard = ({ onLogout }) => {
             }).length * 15000);
 
             if (chartRef.current) {
-                chartInstanceRef.current = new window.Chart(chartRef.current, {
+                chartInstanceRef.current = new Chart(chartRef.current, {
                     type: 'bar',
                     data: {
                         labels: monthBuckets.map(b => b.label),
@@ -290,7 +291,7 @@ const AdminDashboard = ({ onLogout }) => {
             }
 
             if (doughnutRef.current) {
-                doughnutInstanceRef.current = new window.Chart(doughnutRef.current, {
+                doughnutInstanceRef.current = new Chart(doughnutRef.current, {
                     type: 'doughnut',
                     data: {
                         labels: ['Pending', 'Settled', 'Unpaid', 'Cancelled'],
@@ -310,7 +311,7 @@ const AdminDashboard = ({ onLogout }) => {
             }
 
             if (revenueChartRef.current) {
-                revenueInstanceRef.current = new window.Chart(revenueChartRef.current, {
+                revenueInstanceRef.current = new Chart(revenueChartRef.current, {
                     type: 'line',
                     data: {
                         labels: monthBuckets.map(b => b.label),
@@ -346,7 +347,7 @@ const AdminDashboard = ({ onLogout }) => {
                 });
                 if (Object.keys(regionCounts).length === 0) regionCounts['Dodoma'] = 1;
 
-                regionInstanceRef.current = new window.Chart(regionChartRef.current, {
+                regionInstanceRef.current = new Chart(regionChartRef.current, {
                     type: 'polarArea',
                     data: {
                         labels: Object.keys(regionCounts),
@@ -372,7 +373,7 @@ const AdminDashboard = ({ onLogout }) => {
             }
 
             if (typeChartRef.current) {
-                typeInstanceRef.current = new window.Chart(typeChartRef.current, {
+                typeInstanceRef.current = new Chart(typeChartRef.current, {
                     type: 'pie',
                     data: {
                         labels: ['Field Report', 'Research Report'],
@@ -408,7 +409,7 @@ const AdminDashboard = ({ onLogout }) => {
                 const downloadsCount = activeFieldOrders.filter(o => o.objectData.reportPdfUrl).length;
                 const downloadsPct = Math.round((downloadsCount / totalOrdersForActivity) * 100);
 
-                activityInstanceRef.current = new window.Chart(activityChartRef.current, {
+                activityInstanceRef.current = new Chart(activityChartRef.current, {
                     type: 'radar',
                     data: {
                         labels: ['Logbook Uploads', 'Supervisor Edits', 'Settled', 'Payments', 'Report Downloads'],
