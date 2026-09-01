@@ -39,6 +39,29 @@ const writeDashCache = (prefix, key, value) => {
 const isOrderFinal = (order) => !!order?.objectData?.reportPdfUrl;
 const areAllOrdersFinal = (orders) => Array.isArray(orders) && orders.length > 0 && orders.every(isOrderFinal);
 
+// Orders/logbooks are only re-synced with the database once per calendar
+// week for anything already resolved - specifically on the first login of
+// each Saturday. A logbook still pending ("ADMIN IS VERIFYING") is checked
+// every time the dashboard opens instead, regardless of day. Every other
+// case is served purely from the permanent cache above.
+const DASH_SYNC_DATE_PREFIX = 'dashboard_last_sync_';
+
+const readDashLastSyncDate = (key) => {
+    if (!key) return null;
+    try {
+        return localStorage.getItem(`${DASH_SYNC_DATE_PREFIX}${key}`);
+    } catch (e) {
+        return null;
+    }
+};
+
+const writeDashLastSyncDate = (key, dateStr) => {
+    if (!key) return;
+    try {
+        localStorage.setItem(`${DASH_SYNC_DATE_PREFIX}${key}`, dateStr);
+    } catch (e) {}
+};
+
 const StudentDashboard = ({ onLogout }) => {
     const user = JSON.parse(localStorage.getItem('currentUser')) || { fullName: 'Student User' };
     const firstName = user.fullName ? user.fullName.split(' ')[0] : 'Student';
@@ -81,17 +104,9 @@ const StudentDashboard = ({ onLogout }) => {
         setTimeout(() => setCopied(false), 2000);
     };
 
-    // Keep refs of the latest orders/logbooks so the poll below can check
-    // whether everything is already final without needing to be recreated
-    // every time state updates.
-    const ordersRef = React.useRef(userOrders);
-    React.useEffect(() => { ordersRef.current = userOrders; }, [userOrders]);
-    const logbooksRef = React.useRef(logbooks);
-    React.useEffect(() => { logbooksRef.current = logbooks; }, [logbooks]);
-
     // Wraps setUserOrders so every local/optimistic change (cancelling an
     // order, placing a new one, editing payment details, etc.) also updates
-    // the permanent cache immediately - not just the background poll.
+    // the permanent cache immediately - not just the background sync.
     const updateUserOrders = (updater) => {
         setUserOrders(prev => {
             const next = typeof updater === 'function' ? updater(prev) : updater;
@@ -103,12 +118,12 @@ const StudentDashboard = ({ onLogout }) => {
     React.useEffect(() => {
         let isMounted = true;
 
+        // Fetches fresh orders + logbooks and merges them in. Orders are
+        // replaced wholesale on a real sync (their fields all change
+        // together), but logbooks are merged per-week: any week already
+        // digitized in the cache stays exactly as cached - permanently -
+        // and only still-pending weeks get their latest status applied.
         const fetchOrdersAndLogbooks = async () => {
-            // Once every order's report has been delivered, none of its
-            // progress data can change anymore - skip the database call
-            // entirely and keep serving the permanent cache. This is what
-            // makes the percentage bar instant on a later sign-in.
-            if (areAllOrdersFinal(ordersRef.current)) return;
             try {
                 const [myOrdersRes, paidRes] = await Promise.all([
                     dbListObjectsByField('field_report_order', 'regNumber', user.regNumber, 1000, true),
@@ -133,17 +148,76 @@ const StudentDashboard = ({ onLogout }) => {
             try {
                 const logsRes = await dbListObjectsByField('logbook', 'regNumber', user.regNumber, 1000, true);
                 if (isMounted) {
-                    setLogbooks(prev => {
-                        if (JSON.stringify(prev) !== JSON.stringify(logsRes.items)) {
-                            writeDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user.regNumber, logsRes.items);
-                            return logsRes.items;
+                    setLogbooks(prevLogs => {
+                        const freshById = new Map(logsRes.items.map(l => [l.objectId, l]));
+                        const merged = prevLogs.map(prevLog => {
+                            const prevDigitized = String(prevLog.objectData.logbookStatus).toLowerCase() === 'digitized';
+                            if (prevDigitized) return prevLog;
+                            return freshById.get(prevLog.objectId) || prevLog;
+                        });
+                        // Include any logs not previously known locally (new
+                        // uploads made from another device/session).
+                        logsRes.items.forEach(l => {
+                            if (!merged.some(m => m.objectId === l.objectId)) merged.push(l);
+                        });
+                        if (JSON.stringify(prevLogs) !== JSON.stringify(merged)) {
+                            writeDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user.regNumber, merged);
+                            return merged;
                         }
-                        return prev;
+                        return prevLogs;
                     });
                 }
             } catch (e) {}
+
+            writeDashLastSyncDate(user.regNumber, new Date().toISOString().slice(0, 10));
         };
 
+        if (!(user && user.regNumber)) return;
+
+        const cachedOrdersRaw = readDashCache(DASH_ORDERS_CACHE_PREFIX, user.regNumber);
+        const hasSyncedBefore = cachedOrdersRaw !== null;
+        const cachedOrders = cachedOrdersRaw || [];
+        const cachedLogs = readDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user.regNumber) || [];
+
+        if (areAllOrdersFinal(cachedOrders)) {
+            // Every order is fully finished - nothing can change again, so
+            // stay on the permanent cache forever.
+            setIsFetching(false);
+            return () => { isMounted = false; };
+        }
+
+        if (!hasSyncedBefore) {
+            // First time ever for this student - nothing cached yet, must
+            // fetch so there's something to show.
+            fetchOrdersAndLogbooks();
+            return () => { isMounted = false; };
+        }
+
+        setIsFetching(false);
+
+        const hasPendingLogbook = cachedLogs.some(l => String(l.objectData.logbookStatus).toLowerCase() !== 'digitized');
+        if (hasPendingLogbook) {
+            // At least one week is still "ADMIN IS VERIFYING" - check it
+            // every time the dashboard opens, regardless of the day.
+            fetchOrdersAndLogbooks();
+        } else {
+            // Nothing pending right now - only refresh on the first login
+            // of each Saturday; every other day is served purely from
+            // cache with no database call at all.
+            const todayStr = new Date().toISOString().slice(0, 10);
+            const isSaturday = new Date().getDay() === 6;
+            if (isSaturday && readDashLastSyncDate(user.regNumber) !== todayStr) {
+                fetchOrdersAndLogbooks();
+            }
+        }
+
+        return () => { isMounted = false; };
+    }, [user?.regNumber]);
+
+    // Notifications stay on their own short poll, independent of the
+    // orders/logbooks caching schedule above - they're meant to feel live.
+    React.useEffect(() => {
+        let isMounted = true;
         const fetchNotifications = async () => {
             try {
                 const notifRes = await dbListObjectsByField('notification', 'regNumber', user.regNumber, 100, true);
@@ -155,19 +229,9 @@ const StudentDashboard = ({ onLogout }) => {
             }
         };
 
-        const pollTick = async () => {
-            await fetchOrdersAndLogbooks();
-            await fetchNotifications();
-        };
-        
         if (user && user.regNumber) {
-            if (areAllOrdersFinal(ordersRef.current)) {
-                // Fully finished already - the permanent cache is
-                // trustworthy on its own, no need to wait on anything.
-                setIsFetching(false);
-            }
-            pollTick();
-            const intervalId = setInterval(pollTick, 5000);
+            fetchNotifications();
+            const intervalId = setInterval(fetchNotifications, 5000);
             return () => {
                 isMounted = false;
                 clearInterval(intervalId);

@@ -74,9 +74,11 @@ const areLogbooksComplete = (logs, weekLabels) => {
     });
 };
 
-// Logbooks are only re-synced with the database once per calendar week -
-// specifically on the first login of each Saturday. Every other day (and
-// every other login on that same Saturday) is served purely from the
+// Logbooks are only re-synced with the database once per calendar week for
+// weeks that are already fully resolved - specifically on the first login
+// of each Saturday. Any week still pending ("ADMIN IS VERIFYING") is
+// checked every time the tracking screen opens instead, regardless of day
+// (see the effect below). Every other case is served purely from the
 // permanent cache, with no database call at all.
 const LOGBOOK_SYNC_DATE_PREFIX = 'logbook_last_sync_';
 
@@ -96,17 +98,6 @@ const writeLastSyncDate = (orderId, dateStr) => {
     } catch (e) {}
 };
 
-// A fresh database sync is only due when there's no cached data yet at all
-// (first-ever view), or when today is Saturday and this order hasn't
-// already been synced today (i.e. this is the first login this Saturday).
-const isWeeklySyncDue = (orderId, hasCache) => {
-    if (!hasCache) return true;
-    const isSaturday = new Date().getDay() === 6; // 0=Sun ... 6=Sat
-    if (!isSaturday) return false;
-    const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-    return readLastSyncDate(orderId) !== todayStr;
-};
-
 const OrderProgress = ({ order, user, onBack, getOrderNumber, onPayClick, initialExpandedStep = null, skipAnimations = false }) => {
     const [expandedStep, setExpandedStep] = React.useState(initialExpandedStep);
     const [downloadState, setDownloadState] = React.useState('idle');
@@ -123,6 +114,10 @@ const OrderProgress = ({ order, user, onBack, getOrderNumber, onPayClick, initia
     const streamRef = React.useRef(null);
 
     const [initialLoadDone, setInitialLoadDone] = React.useState(false);
+    // True only while genuinely fetching for the very first time ever (no
+    // cached logbook data exists at all yet) - used to dim/disable the
+    // per-week buttons until there's real data to act on.
+    const [isInitialFetching, setIsInitialFetching] = React.useState(() => readLogbookCache(order?.objectId) === null);
     const [hasAnimated, setHasAnimated] = React.useState(false);
     const [showReminder, setShowReminder] = React.useState(false);
     const [isAnimatingSequence, setIsAnimatingSequence] = React.useState(false);
@@ -256,63 +251,90 @@ const OrderProgress = ({ order, user, onBack, getOrderNumber, onPayClick, initia
         return nameValid && posValid && hasChanges;
     };
 
-    // Keeps the latest logbooks in a ref so the polling loop below can check
-    // completeness without needing to be recreated every time state changes.
-    const logbooksRef = React.useRef(logbooks);
-    React.useEffect(() => {
-        logbooksRef.current = logbooks;
-    }, [logbooks]);
-
     React.useEffect(() => {
         let isMounted = true;
-        let intervalId = null;
         const weekLabels = orderProgressStepsData[0].subSteps;
 
+        // Fetches the latest logbook data and merges it in, but treats any
+        // week that's already digitized in the cache as permanently final -
+        // it's never overwritten again, even by a fresh response. Only
+        // still-pending weeks ("ADMIN IS VERIFYING") actually get updated.
         const fetchLogbooks = async () => {
-            // Once every week is already digitized, nothing about this
-            // order's logbooks can change anymore - skip the database call
-            // entirely and keep serving the permanent cache.
-            if (areLogbooksComplete(logbooksRef.current, weekLabels)) return;
             try {
                 const res = await dbListObjectsByField('logbook', 'orderId', order.objectId, 10, true);
                 if (!isMounted) return;
-                const myLogs = res.items;
-                setLogbooks(myLogs);
-                writeLogbookCache(order.objectId, myLogs);
-                setInitialLoadDone(true);
+                const freshLogs = res.items;
+                setLogbooks(prevLogs => {
+                    const merged = weekLabels
+                        .map(week => {
+                            const prevLog = prevLogs.find(l => l.objectData.week === week);
+                            const prevDigitized = prevLog && String(prevLog.objectData.logbookStatus).toLowerCase() === 'digitized';
+                            if (prevDigitized) return prevLog;
+                            return freshLogs.find(l => l.objectData.week === week) || prevLog;
+                        })
+                        .filter(Boolean);
+                    writeLogbookCache(order.objectId, merged);
+                    return merged;
+                });
                 writeLastSyncDate(order.objectId, new Date().toISOString().slice(0, 10));
             } catch (e) {
                 console.error("Failed to fetch logbooks", e);
+            } finally {
+                if (isMounted) {
+                    setInitialLoadDone(true);
+                    setIsInitialFetching(false);
+                }
             }
         };
 
-        const cached = readLogbookCache(order.objectId);
-        if (cached) {
-            logbooksRef.current = cached;
-        }
-
+        // A cache that has never been written is `null`; an order with zero
+        // logbooks uploaded yet but that has already been checked once is a
+        // real (possibly empty) cached array - the two are not the same.
+        const cachedRaw = readLogbookCache(order.objectId);
+        const hasSyncedBefore = cachedRaw !== null;
+        const cached = cachedRaw || [];
         const complete = areLogbooksComplete(cached, weekLabels);
-        const syncDue = !complete && isWeeklySyncDue(order.objectId, !!cached);
 
-        if (complete || !syncDue) {
-            // Either fully finished, or it's not this order's weekly sync
-            // day yet (or already synced once today) - trust the permanent
-            // cache and show it instantly with no network round trip.
+        if (complete) {
+            // Every week is already digitized - nothing can ever change
+            // again, so stay on the permanent cache forever.
             setInitialLoadDone(true);
-        } else {
-            // No cache yet, or today is the first Saturday login for this
-            // order - sync with the database once. While that sync is in
-            // progress, keep a light poll running so an in-progress week
-            // can pick up its "digitized" status live during this viewing
-            // session (it stops on its own the moment everything's final).
-            fetchLogbooks();
-            intervalId = setInterval(fetchLogbooks, 3000);
+            setIsInitialFetching(false);
+            return () => { isMounted = false; };
         }
 
-        return () => {
-            isMounted = false;
-            if (intervalId) clearInterval(intervalId);
-        };
+        if (!hasSyncedBefore) {
+            // First time this order's logbooks have ever been viewed -
+            // there's nothing cached yet, so a fetch is unavoidable. The
+            // per-week buttons dim/disable (via isInitialFetching) until
+            // this resolves.
+            setIsInitialFetching(true);
+            fetchLogbooks();
+            return () => { isMounted = false; };
+        }
+
+        setInitialLoadDone(true);
+        setIsInitialFetching(false);
+
+        const hasPending = cached.some(l => String(l.objectData.logbookStatus).toLowerCase() !== 'digitized');
+        if (hasPending) {
+            // At least one week is still "ADMIN IS VERIFYING" - check its
+            // status every single time the tracking screen is opened,
+            // regardless of the day, so a newly digitized week shows up
+            // right away without waiting for Saturday.
+            fetchLogbooks();
+        } else {
+            // Nothing pending right now - only do the weekly safety sync on
+            // the first login of each Saturday; every other day this is
+            // served purely from cache with no network call at all.
+            const todayStr = new Date().toISOString().slice(0, 10);
+            const isSaturday = new Date().getDay() === 6;
+            if (isSaturday && readLastSyncDate(order.objectId) !== todayStr) {
+                fetchLogbooks();
+            }
+        }
+
+        return () => { isMounted = false; };
     }, [order.objectId]);
     
     React.useEffect(() => {
@@ -875,15 +897,15 @@ const OrderProgress = ({ order, user, onBack, getOrderNumber, onPayClick, initia
                                                                         )}
                                                                         
                                                                         {isLogbookStep && (
-                                                                            <div className="flex gap-1.5 items-center shrink-0">
+                                                                            <div className={`flex gap-1.5 items-center shrink-0 transition-opacity duration-300 ${isInitialFetching ? 'opacity-40 pointer-events-none' : 'opacity-100'}`}>
                                                                                 {!log ? (
-                                                                                    <button onClick={(e) => { e.stopPropagation(); startUpload(sub); }} className="bg-[var(--primary-color)] text-white hover:bg-[var(--primary-dark)] px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm">UPLOAD</button>
+                                                                                    <button disabled={isInitialFetching} onClick={(e) => { e.stopPropagation(); startUpload(sub); }} className="bg-[var(--primary-color)] text-white hover:bg-[var(--primary-dark)] px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm">UPLOAD</button>
                                                                                 ) : isProcessingLocally ? (
                                                                                     <span className="bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded text-[9px] font-bold shadow-sm whitespace-nowrap">ADMIN IS VERIFYING</span>
                                                                                 ) : isDigitized ? (
                                                                                     <>
-                                                                                        <button onClick={(e) => { e.stopPropagation(); setActiveWeek(sub); setScannerPhase('viewing'); }} className="bg-blue-100 text-blue-600 hover:bg-blue-200 px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm">PREVIEW</button>
-                                                                                        {!order.objectData?.settled && <button onClick={(e) => { e.stopPropagation(); startUpload(sub); }} className="bg-gray-200 text-gray-700 hover:bg-gray-300 px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm border border-gray-300">CHANGE</button>}
+                                                                                        <button disabled={isInitialFetching} onClick={(e) => { e.stopPropagation(); setActiveWeek(sub); setScannerPhase('viewing'); }} className="bg-blue-100 text-blue-600 hover:bg-blue-200 px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm">PREVIEW</button>
+                                                                                        {!order.objectData?.settled && <button disabled={isInitialFetching} onClick={(e) => { e.stopPropagation(); startUpload(sub); }} className="bg-gray-200 text-gray-700 hover:bg-gray-300 px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm border border-gray-300">CHANGE</button>}
                                                                                     </>
                                                                                 ) : null}
                                                                             </div>
