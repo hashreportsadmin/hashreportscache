@@ -7,11 +7,16 @@ import { calculateOrderProgress, dbCreateObject, dbListMinimalByField, dbListObj
 import { formatPhone } from '../utils/formatters';
 
 // --- Dashboard order/logbook cache ---------------------------------------
-// The "Your Order in Progress" percentage bar (and every step status on the
-// tracking screen, since it's all derived from this same order data) is
-// cached permanently in localStorage per student. That means it renders
-// instantly from cache - no waiting on the database - and survives signing
-// out or closing the browser, exactly like the Upload Logbook tracker does.
+// Every login (or browser refresh) does exactly ONE fresh load of orders +
+// logbooks. The "Your Order in Progress" card stays in its loading state
+// until BOTH have finished, so the percentage and every tracking-screen
+// detail are correct from the very first paint - no flashing an incomplete
+// percentage while logbooks are still arriving. Once that single load
+// completes, everything is written to localStorage and served purely from
+// there for the rest of the session: opening the tracking screen, going
+// back, reopening it again, switching tabs - none of it fetches again.
+// Only signing out and back in, or refreshing the browser, starts a new
+// load cycle.
 const DASH_ORDERS_CACHE_PREFIX = 'cached_dashboard_orders_';
 const DASH_LOGBOOKS_CACHE_PREFIX = 'cached_dashboard_logbooks_';
 
@@ -32,43 +37,15 @@ const writeDashCache = (prefix, key, value) => {
     } catch (e) {}
 };
 
-// An order's progress is "final" once its report has been delivered -
-// nothing about its percentage or step statuses can change after that
-// (mirrors how the Admin and tracking screens already treat reportPdfUrl
-// as the completed state).
-const isOrderFinal = (order) => !!order?.objectData?.reportPdfUrl;
-const areAllOrdersFinal = (orders) => Array.isArray(orders) && orders.length > 0 && orders.every(isOrderFinal);
-
-// Orders/logbooks are only re-synced with the database once per calendar
-// week for anything already resolved - specifically on the first login of
-// each Saturday. A logbook still pending ("ADMIN IS VERIFYING") is checked
-// every time the dashboard opens instead, regardless of day. Every other
-// case is served purely from the permanent cache above.
-const DASH_SYNC_DATE_PREFIX = 'dashboard_last_sync_';
-
-const readDashLastSyncDate = (key) => {
-    if (!key) return null;
-    try {
-        return localStorage.getItem(`${DASH_SYNC_DATE_PREFIX}${key}`);
-    } catch (e) {
-        return null;
-    }
-};
-
-const writeDashLastSyncDate = (key, dateStr) => {
-    if (!key) return;
-    try {
-        localStorage.setItem(`${DASH_SYNC_DATE_PREFIX}${key}`, dateStr);
-    } catch (e) {}
-};
-
 const StudentDashboard = ({ onLogout }) => {
     const user = JSON.parse(localStorage.getItem('currentUser')) || { fullName: 'Student User' };
     const firstName = user.fullName ? user.fullName.split(' ')[0] : 'Student';
     const [orderFlowKey, setOrderFlowKey] = React.useState(0);
     const [showOrderFlow, setShowOrderFlow] = React.useState(false);
     const [userOrders, setUserOrders] = React.useState(() => readDashCache(DASH_ORDERS_CACHE_PREFIX, user?.regNumber) || []);
-    const [isFetching, setIsFetching] = React.useState(() => !readDashCache(DASH_ORDERS_CACHE_PREFIX, user?.regNumber));
+    // Every login/refresh starts in a loading state - it only clears once
+    // this session's single fresh load of orders + logbooks has finished.
+    const [isFetching, setIsFetching] = React.useState(true);
     const [viewingOrderId, setViewingOrderId] = React.useState(null);
     const [allPaidOrders, setAllPaidOrders] = React.useState([]);
     const [showPaymentPopup, setShowPaymentPopup] = React.useState(false);
@@ -115,14 +92,27 @@ const StudentDashboard = ({ onLogout }) => {
         });
     };
 
+    // Same wrapper for logbooks - this is the single shared list the
+    // tracking screen also reads from (passed down as `allLogbooks`), so an
+    // optimistic upload made from the tracking screen updates the exact
+    // same state the dashboard's percentage badge is computed from.
+    const updateLogbooks = (updater) => {
+        setLogbooks(prev => {
+            const next = typeof updater === 'function' ? updater(prev) : updater;
+            writeDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user.regNumber, next);
+            return next;
+        });
+    };
+
     React.useEffect(() => {
         let isMounted = true;
 
-        // Fetches fresh orders + logbooks and merges them in. Orders are
-        // replaced wholesale on a real sync (their fields all change
-        // together), but logbooks are merged per-week: any week already
-        // digitized in the cache stays exactly as cached - permanently -
-        // and only still-pending weeks get their latest status applied.
+        // One fresh load per login/refresh: fetch orders, then logbooks,
+        // and only clear the loading state once BOTH have finished. That
+        // way the order card and everything the tracking screen needs are
+        // guaranteed correct and ready before anything is shown - no
+        // flashing an incomplete percentage while logbooks are still
+        // arriving in the background.
         const fetchOrdersAndLogbooks = async () => {
             try {
                 const [myOrdersRes, paidRes] = await Promise.all([
@@ -132,14 +122,8 @@ const StudentDashboard = ({ onLogout }) => {
                 if (isMounted) {
                     const myOrders = myOrdersRes.items.filter(o => o.objectData.status !== 'CANCELLED');
                     setAllPaidOrders(paidRes.items);
-                    setUserOrders(prev => {
-                        if (JSON.stringify(prev) !== JSON.stringify(myOrders)) {
-                            writeDashCache(DASH_ORDERS_CACHE_PREFIX, user.regNumber, myOrders);
-                            return myOrders;
-                        }
-                        return prev;
-                    });
-                    setIsFetching(false);
+                    setUserOrders(myOrders);
+                    writeDashCache(DASH_ORDERS_CACHE_PREFIX, user.regNumber, myOrders);
                 }
             } catch (e) {
                 console.error("Failed to fetch orders", e);
@@ -148,68 +132,24 @@ const StudentDashboard = ({ onLogout }) => {
             try {
                 const logsRes = await dbListObjectsByField('logbook', 'regNumber', user.regNumber, 1000, true);
                 if (isMounted) {
-                    setLogbooks(prevLogs => {
-                        const freshById = new Map(logsRes.items.map(l => [l.objectId, l]));
-                        const merged = prevLogs.map(prevLog => {
-                            const prevDigitized = String(prevLog.objectData.logbookStatus).toLowerCase() === 'digitized';
-                            if (prevDigitized) return prevLog;
-                            return freshById.get(prevLog.objectId) || prevLog;
-                        });
-                        // Include any logs not previously known locally (new
-                        // uploads made from another device/session).
-                        logsRes.items.forEach(l => {
-                            if (!merged.some(m => m.objectId === l.objectId)) merged.push(l);
-                        });
-                        if (JSON.stringify(prevLogs) !== JSON.stringify(merged)) {
-                            writeDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user.regNumber, merged);
-                            return merged;
-                        }
-                        return prevLogs;
-                    });
+                    setLogbooks(logsRes.items);
+                    writeDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user.regNumber, logsRes.items);
                 }
-            } catch (e) {}
+            } catch (e) {
+                console.error("Failed to fetch logbooks", e);
+            }
 
-            writeDashLastSyncDate(user.regNumber, new Date().toISOString().slice(0, 10));
+            if (isMounted) {
+                // Only now - after both orders and logbooks are in - is the
+                // order card (and everything the tracking screen needs)
+                // actually ready to display instantly.
+                setIsFetching(false);
+            }
         };
 
         if (!(user && user.regNumber)) return;
 
-        const cachedOrdersRaw = readDashCache(DASH_ORDERS_CACHE_PREFIX, user.regNumber);
-        const hasSyncedBefore = cachedOrdersRaw !== null;
-        const cachedOrders = cachedOrdersRaw || [];
-        const cachedLogs = readDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user.regNumber) || [];
-
-        if (areAllOrdersFinal(cachedOrders)) {
-            // Every order is fully finished - nothing can change again, so
-            // stay on the permanent cache forever.
-            setIsFetching(false);
-            return () => { isMounted = false; };
-        }
-
-        if (!hasSyncedBefore) {
-            // First time ever for this student - nothing cached yet, must
-            // fetch so there's something to show.
-            fetchOrdersAndLogbooks();
-            return () => { isMounted = false; };
-        }
-
-        setIsFetching(false);
-
-        const hasPendingLogbook = cachedLogs.some(l => String(l.objectData.logbookStatus).toLowerCase() !== 'digitized');
-        if (hasPendingLogbook) {
-            // At least one week is still "ADMIN IS VERIFYING" - check it
-            // every time the dashboard opens, regardless of the day.
-            fetchOrdersAndLogbooks();
-        } else {
-            // Nothing pending right now - only refresh on the first login
-            // of each Saturday; every other day is served purely from
-            // cache with no database call at all.
-            const todayStr = new Date().toISOString().slice(0, 10);
-            const isSaturday = new Date().getDay() === 6;
-            if (isSaturday && readDashLastSyncDate(user.regNumber) !== todayStr) {
-                fetchOrdersAndLogbooks();
-            }
-        }
+        fetchOrdersAndLogbooks();
 
         return () => { isMounted = false; };
     }, [user?.regNumber]);
@@ -525,6 +465,8 @@ const StudentDashboard = ({ onLogout }) => {
                     onPayClick={() => { pushInnerScreenState(); setShowPaymentPopup(true); }}
                     initialExpandedStep={initialTrackingStep}
                     skipAnimations={skipAnimations}
+                    allLogbooks={logbooks}
+                    onUpdateLogbooks={updateLogbooks}
                 />
             ) : showNotificationsScreen ? (
                 <div className="flex flex-col h-full bg-gray-50 min-h-screen">
