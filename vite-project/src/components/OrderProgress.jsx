@@ -1,6 +1,6 @@
 import React from 'react';
 import { Popup } from './SharedUI';
-import { calculateOrderProgress, dbCreateObject, dbUpdateObject } from '../utils/db';
+import { calculateOrderProgress, dbCreateObject, dbDeleteUploadedImage, dbUpdateObject, dbUploadImage } from '../utils/db';
 
 const orderProgressStepsData = [
     { title: "Uploading Logbook", subSteps: ["Week 1", "Week 2", "Week 3", "Week 4", "Week 5", "Week 6"] },
@@ -506,11 +506,29 @@ const OrderProgress = ({ order, user, onBack, getOrderNumber, onPayClick, initia
     const uploadScannedLogbook = async () => {
         setIsProcessing(true);
         try {
+            // Upload to Supabase Storage instead of storing the base64 scan
+            // inline in the row - keeps every future logbook-status query
+            // (percentage bar, admin tables, etc.) lightweight, since they
+            // no longer have to drag the image bytes along even when they
+            // don't need them. Falls back to the inline base64 if Storage
+            // isn't set up yet, so uploading still works either way.
+            let uploadedRawImage = capturedImage;
+            try {
+                uploadedRawImage = await dbUploadImage('logbooks/raw', capturedImage);
+            } catch (e) {
+                console.error("Storage upload failed, keeping inline image:", e);
+            }
+
             const existingLog = logbooks.find(l => l.objectData.week === activeWeek);
             if (existingLog) {
+                // Clean up the previous raw upload in Storage (if any) now
+                // that it's being replaced, so old scans don't pile up.
+                if (existingLog.objectData.rawImage) {
+                    dbDeleteUploadedImage(existingLog.objectData.rawImage);
+                }
                 const updatedLogData = {
                     ...existingLog.objectData,
-                    rawImage: capturedImage,
+                    rawImage: uploadedRawImage,
                     digitizedImage: null,
                     logbookStatus: 'processing'
                 };
@@ -530,7 +548,7 @@ const OrderProgress = ({ order, user, onBack, getOrderNumber, onPayClick, initia
                     regNumber: user.regNumber,
                     orderId: order.objectId,
                     week: activeWeek,
-                    rawImage: capturedImage,
+                    rawImage: uploadedRawImage,
                     digitizedImage: null,
                     logbookStatus: 'processing'
                 });

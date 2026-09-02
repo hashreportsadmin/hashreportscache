@@ -2,13 +2,11 @@ import React from 'react';
 import { ContactFooter } from './ContactFooter';
 import { BackgroundShapes, CustomSelect, LogoHeader, Popup, ValidatedInput } from './SharedUI';
 import { Welcome } from './Welcome';
-import { dbCreateObject, dbListObjects } from '../utils/db';
+import { dbCreateObject, dbListObjectsByField, dbUploadImage } from '../utils/db';
 import { formatEmail, formatFullName, formatPhone, formatRegNumber } from '../utils/formatters';
 
 const SignUp = ({ onNavigate }) => {
     const [step, setStep] = React.useState(1);
-    const [isRegRegistered, setIsRegRegistered] = React.useState(false);
-    const [isCheckingReg, setIsCheckingReg] = React.useState(false);
     const [formData, setFormData] = React.useState({
         fullName: '', photo: null, photoUrl: '',
         university: '', course: '', regNumber: '',
@@ -318,39 +316,15 @@ const SignUp = ({ onNavigate }) => {
         return null;
     };
 
-    const handleRegChange = async (val) => {
+    const handleRegChange = (val) => {
         const formatted = formatRegNumber(val, formData.regNumber);
         setFormData(prev => ({...prev, regNumber: formatted}));
-        
-        if (formatted.length === 12) {
-            setIsCheckingReg(true);
-            try {
-                const res = await dbListObjects('user', 1000, false);
-                const exists = res.items.some(u => u.objectData.regNumber === formatted && !u.objectData.deleted);
-                if (exists) {
-                    setIsRegRegistered(true);
-                    triggerPopup("Already Registered", "This Registration Number is Already Registered in Our System, Sign In to your Account with your Password", "exists", "🚨");
-                } else {
-                    setIsRegRegistered(false);
-                    if (!valUni(formData.university) && formData.university === "University of Dodoma" && !valCourse(formData.course)) {
-                        setTimeout(() => document.activeElement?.blur(), 100);
-                    }
-                }
-            } catch (e) {
-                console.error(e);
-            } finally {
-                setIsCheckingReg(false);
-            }
-        } else {
-            setIsRegRegistered(false);
-            setIsCheckingReg(false);
-        }
     };
 
     const isStepValid = () => {
         switch(step) {
             case 1: return !valName(formData.fullName) && formData.photoUrl !== '';
-            case 2: return !valUni(formData.university) && formData.university === "University of Dodoma" && !valCourse(formData.course) && !valReg(formData.regNumber) && !isRegRegistered && !isCheckingReg;
+            case 2: return !valUni(formData.university) && formData.university === "University of Dodoma" && !valCourse(formData.course) && !valReg(formData.regNumber);
             case 3: return !valPhone(formData.normalPhone) && !valPhone(formData.whatsappNumber) && !valEmail(formData.email);
             case 4: return !valPass(formData.password) && !valConfirm(formData.confirmPassword);
             default: return true;
@@ -359,7 +333,33 @@ const SignUp = ({ onNavigate }) => {
 
     // Removed automatic input blur effect to allow continuous typing
 
-    const handleNext = () => {
+    const handleNext = async () => {
+        if (step === 2) {
+            // Only now - when the user actually clicks NEXT - do we check
+            // the database, and only for this one registration number
+            // (server-side filter), instead of downloading every user on
+            // every keystroke. The button is already disabled + spinning
+            // via isLoading while this resolves.
+            setIsLoading(true);
+            try {
+                const res = await dbListObjectsByField('user', 'regNumber', formData.regNumber, 5, false);
+                const exists = res.items.some(u => u.objectData.regNumber === formData.regNumber && !u.objectData.deleted);
+                if (exists) {
+                    setIsLoading(false);
+                    triggerPopup("Already Registered", "This Registration Number is Already Registered in Our System, Sign In to your Account with your Password", "exists", "🚨");
+                    return;
+                }
+            } catch (e) {
+                console.error(e);
+                setIsLoading(false);
+                triggerPopup("Connection Error", "Could not verify your Registration Number. Please check your connection and try again.", "error", "❌");
+                return;
+            }
+            setIsLoading(false);
+            setStep(prev => prev + 1);
+            return;
+        }
+
         setIsLoading(true);
         setTimeout(() => {
             setIsLoading(false);
@@ -402,6 +402,18 @@ const SignUp = ({ onNavigate }) => {
                     img.src = dbData.photoUrl;
                 });
                 dbData.photoUrl = compressedPhoto;
+
+                // Upload to Supabase Storage instead of keeping the base64
+                // string in the database row - every future query that reads
+                // this user (admin lists, dashboards, etc.) then only pulls a
+                // short URL instead of the full image every time. Falls back
+                // to the compressed base64 if Storage isn't set up yet, so
+                // sign-up still works either way.
+                try {
+                    dbData.photoUrl = await dbUploadImage('profiles', dbData.photoUrl);
+                } catch (e) {
+                    console.error("Storage upload failed, keeping inline image:", e);
+                }
             }
 
             await dbCreateObject('user', dbData);

@@ -107,44 +107,46 @@ const StudentDashboard = ({ onLogout }) => {
     React.useEffect(() => {
         let isMounted = true;
 
-        // One fresh load per login/refresh: fetch orders, then logbooks,
-        // and only clear the loading state once BOTH have finished. That
-        // way the order card and everything the tracking screen needs are
-        // guaranteed correct and ready before anything is shown - no
-        // flashing an incomplete percentage while logbooks are still
-        // arriving in the background.
+        // One fresh load per login/refresh: all three queries fire together
+        // (previously logbooks only started after orders finished), so the
+        // total wait is roughly the slowest single query instead of the sum
+        // of both - the order card clears its loading state only once
+        // everything has come back, so it's still guaranteed complete and
+        // correct, just faster to get there.
         const fetchOrdersAndLogbooks = async () => {
-            try {
-                const [myOrdersRes, paidRes] = await Promise.all([
-                    dbListObjectsByField('field_report_order', 'regNumber', user.regNumber, 1000, true),
-                    dbListMinimalByField('field_report_order', 'status', 'PAID')
-                ]);
-                if (isMounted) {
-                    const myOrders = myOrdersRes.items.filter(o => o.objectData.status !== 'CANCELLED');
-                    setAllPaidOrders(paidRes.items);
-                    setUserOrders(myOrders);
-                    writeDashCache(DASH_ORDERS_CACHE_PREFIX, user.regNumber, myOrders);
-                }
-            } catch (e) {
-                console.error("Failed to fetch orders", e);
+            const [myOrdersRes, paidRes, logsRes] = await Promise.allSettled([
+                dbListObjectsByField('field_report_order', 'regNumber', user.regNumber, 1000, true),
+                dbListMinimalByField('field_report_order', 'status', 'PAID'),
+                dbListObjectsByField('logbook', 'regNumber', user.regNumber, 1000, true)
+            ]);
+
+            if (!isMounted) return;
+
+            if (myOrdersRes.status === 'fulfilled') {
+                const myOrders = myOrdersRes.value.items.filter(o => o.objectData.status !== 'CANCELLED');
+                setUserOrders(myOrders);
+                writeDashCache(DASH_ORDERS_CACHE_PREFIX, user.regNumber, myOrders);
+            } else {
+                console.error("Failed to fetch orders", myOrdersRes.reason);
             }
 
-            try {
-                const logsRes = await dbListObjectsByField('logbook', 'regNumber', user.regNumber, 1000, true);
-                if (isMounted) {
-                    setLogbooks(logsRes.items);
-                    writeDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user.regNumber, logsRes.items);
-                }
-            } catch (e) {
-                console.error("Failed to fetch logbooks", e);
+            if (paidRes.status === 'fulfilled') {
+                setAllPaidOrders(paidRes.value.items);
+            } else {
+                console.error("Failed to fetch paid orders", paidRes.reason);
             }
 
-            if (isMounted) {
-                // Only now - after both orders and logbooks are in - is the
-                // order card (and everything the tracking screen needs)
-                // actually ready to display instantly.
-                setIsFetching(false);
+            if (logsRes.status === 'fulfilled') {
+                setLogbooks(logsRes.value.items);
+                writeDashCache(DASH_LOGBOOKS_CACHE_PREFIX, user.regNumber, logsRes.value.items);
+            } else {
+                console.error("Failed to fetch logbooks", logsRes.reason);
             }
+
+            // Only now - after everything has come back - is the order card
+            // (and everything the tracking screen needs) actually ready to
+            // display instantly.
+            setIsFetching(false);
         };
 
         if (!(user && user.regNumber)) return;
@@ -721,7 +723,7 @@ const StudentDashboard = ({ onLogout }) => {
                     </div>
                     <div className="grid grid-cols-5 gap-2 pb-2">
                         <div className="flex flex-col items-center gap-1.5 w-full">
-                            <button onClick={handlePlaceNewOrderClick} disabled={showOrderFlow} className="w-full max-w-[3.5rem] aspect-square bg-blue-50 border border-blue-100 rounded-xl flex items-center justify-center text-blue-600 shadow-sm mx-auto active:scale-95 transition-transform disabled:opacity-50">
+                            <button onClick={handlePlaceNewOrderClick} disabled={showOrderFlow || isFetching} className="w-full max-w-[3.5rem] aspect-square bg-blue-50 border border-blue-100 rounded-xl flex items-center justify-center text-blue-600 shadow-sm mx-auto active:scale-95 transition-transform disabled:opacity-50">
                                 <div className="icon-file-plus text-xl"></div>
                             </button>
                             <span className="text-[9px] text-center text-gray-600 leading-tight">Place New<br/>Order</span>
@@ -733,7 +735,7 @@ const StudentDashboard = ({ onLogout }) => {
                             <span className="text-[9px] text-center text-gray-600 leading-tight">My<br/>Orders</span>
                         </div>
                         <div className="flex flex-col items-center gap-1.5 w-full">
-                            <button onClick={handleUploadLogbookClick} className="w-full max-w-[3.5rem] aspect-square bg-green-50 border border-green-100 rounded-xl flex items-center justify-center text-green-600 shadow-sm mx-auto">
+                            <button onClick={handleUploadLogbookClick} disabled={isFetching} className="w-full max-w-[3.5rem] aspect-square bg-green-50 border border-green-100 rounded-xl flex items-center justify-center text-green-600 shadow-sm mx-auto disabled:opacity-50">
                                 <div className="icon-upload text-xl"></div>
                             </button>
                             <span className="text-[9px] text-center text-gray-600 leading-tight">Upload<br/>Logbook</span>

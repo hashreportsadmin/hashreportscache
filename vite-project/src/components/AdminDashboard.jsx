@@ -2,7 +2,7 @@ import React from 'react';
 import Chart from 'chart.js/auto';
 import { Popup } from './SharedUI';
 import { Welcome } from './Welcome';
-import { calculateOrderProgress, dbCreateObject, dbDeleteObject, dbListObjects, dbUpdateObject } from '../utils/db';
+import { calculateOrderProgress, dbCreateObject, dbDeleteObject, dbDeleteUploadedImage, dbListObjects, dbUpdateObject, dbUploadImage } from '../utils/db';
 
 // --- Admin panel permanent cache ------------------------------------------
 // Every collection the admin panel uses is cached in localStorage. That
@@ -98,6 +98,45 @@ const AdminDashboard = ({ onLogout }) => {
     const adminAuthority = localStorage.getItem('adminAuthority') || "Chief Executive Officer";
     const [activeTab, setActiveTab] = React.useState('Dashboard');
     const [searchQuery, setSearchQuery] = React.useState('');
+    // Client-side pagination for the large browsable tables (Registered
+    // Users, Field Report Orders, Logbooks). This doesn't reduce database
+    // egress by itself (the full cached list is already loaded once per
+    // login for search/stats to work instantly), but it keeps the DOM from
+    // rendering hundreds of rows at once as the tables grow.
+    const PAGE_SIZE = 25;
+    const [currentPage, setCurrentPage] = React.useState({});
+    const getPage = (key) => currentPage[key] || 1;
+    const paginate = (items, key) => {
+        const page = getPage(key);
+        const start = (page - 1) * PAGE_SIZE;
+        return items.slice(start, start + PAGE_SIZE);
+    };
+    const PaginationBar = ({ items, pageKey }) => {
+        const page = getPage(pageKey);
+        const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+        if (items.length <= PAGE_SIZE) return null;
+        return (
+            <div className="flex items-center justify-between px-3 py-2.5 border-t border-gray-100 text-[11px] text-gray-500 bg-gray-50/50">
+                <span>Page {page} of {totalPages} ({items.length} total)</span>
+                <div className="flex gap-2">
+                    <button
+                        disabled={page <= 1}
+                        onClick={() => setCurrentPage(p => ({ ...p, [pageKey]: page - 1 }))}
+                        className="px-2.5 py-1 rounded border border-gray-200 bg-white hover:bg-gray-100 disabled:opacity-40 disabled:hover:bg-white font-medium"
+                    >
+                        Prev
+                    </button>
+                    <button
+                        disabled={page >= totalPages}
+                        onClick={() => setCurrentPage(p => ({ ...p, [pageKey]: Math.min(totalPages, page + 1) }))}
+                        className="px-2.5 py-1 rounded border border-gray-200 bg-white hover:bg-gray-100 disabled:opacity-40 disabled:hover:bg-white font-medium"
+                    >
+                        Next
+                    </button>
+                </div>
+            </div>
+        );
+    };
     const [users, setUsers] = useCachedState(ADMIN_CACHE_KEYS.users, []);
     const [allPaidOrders, setAllPaidOrders] = React.useState(() => {
         const cachedOrders = readAdminCache(ADMIN_CACHE_KEYS.fieldOrders) || [];
@@ -214,14 +253,27 @@ const AdminDashboard = ({ onLogout }) => {
         // Dashboard / Pending Orders / Logbooks / etc. is always served from
         // the already-loaded, cached state - no per-tab database fetch.
         loadData();
+        // This background sync used to run every 5 seconds, which meant
+        // four full-table downloads (users, orders, requests, logbooks -
+        // including every profile photo and logbook scan) every 5 seconds
+        // for as long as the admin panel stayed open. That was the single
+        // largest source of database egress. It's now just an infrequent
+        // safety net - a browser refresh (Ctrl+R / Cmd+R) is the way to
+        // pull the latest data on demand.
         const intervalId = setInterval(() => {
             if (isMounted) loadData();
-        }, 5000);
+        }, 120000);
         return () => {
             isMounted = false;
             clearInterval(intervalId);
         };
     }, []);
+
+    React.useEffect(() => {
+        // Any change to the search text invalidates whatever page number
+        // was showing (a filtered result set may now have fewer pages).
+        setCurrentPage({});
+    }, [searchQuery]);
 
     React.useEffect(() => {
         setSearchQuery('');
@@ -455,6 +507,9 @@ const AdminDashboard = ({ onLogout }) => {
         if (userToDelete) {
             try {
                 await dbDeleteObject('user', userToDelete.objectId);
+                if (userToDelete.objectData?.photoUrl) {
+                    dbDeleteUploadedImage(userToDelete.objectData.photoUrl);
+                }
                 setUsers(users.filter(u => u.objectId !== userToDelete.objectId));
             } catch (e) {
                 console.error("Failed to delete user", e);
@@ -768,7 +823,12 @@ const AdminDashboard = ({ onLogout }) => {
                             const canvas = document.createElement('canvas');
                             let width = img.width;
                             let height = img.height;
-                            const max_size = 1000;
+                            // 950px is still comfortably readable for a scanned
+                            // logbook page's handwriting/text, but noticeably
+                            // fewer pixels to encode than 1000px - smaller file,
+                            // and this whole pass (draw + encode) stays a single
+                            // synchronous step, so it isn't any slower.
+                            const max_size = 950;
                             if (width > height && width > max_size) {
                                 height *= max_size / width;
                                 width = max_size;
@@ -782,13 +842,52 @@ const AdminDashboard = ({ onLogout }) => {
                             ctx.fillStyle = "#ffffff";
                             ctx.fillRect(0, 0, width, height);
                             ctx.drawImage(img, 0, 0, width, height);
-                            const base64Image = canvas.toDataURL('image/jpeg', 0.6);
+
+                            // WebP compresses noticeably smaller than JPEG at the
+                            // same visual quality - since this is only ever
+                            // shown in an <img> tag (never embedded in a PDF),
+                            // it's a safe, purely-smaller swap. Every modern
+                            // browser used for admin work supports it, but if
+                            // one somehow doesn't, the canvas silently falls
+                            // back to PNG - so we detect that and use JPEG
+                            // instead rather than shipping a huge PNG.
+                            let base64Image = canvas.toDataURL('image/webp', 0.6);
+                            if (!base64Image.startsWith('data:image/webp')) {
+                                base64Image = canvas.toDataURL('image/jpeg', 0.6);
+                            }
+
+                            // Upload to Supabase Storage instead of storing
+                            // the base64 string inline - this is what keeps
+                            // every future logbook query lightweight, since
+                            // it no longer carries the image bytes with it.
+                            // Falls back to the inline base64 if Storage
+                            // isn't set up yet, so digitizing still works.
+                            let digitizedImageValue = base64Image;
+                            try {
+                                digitizedImageValue = await dbUploadImage('logbooks/digitized', base64Image);
+                            } catch (e) {
+                                console.error("Storage upload failed, keeping inline image:", e);
+                            }
                             
                             const log = logbooks.find(l => l.objectId === logbookId);
                             if(log) {
+                                // Clean up both the raw upload and any
+                                // previous digitized copy in Storage now
+                                // that they're being replaced/removed.
+                                if (log.objectData.rawImage) {
+                                    dbDeleteUploadedImage(log.objectData.rawImage);
+                                }
+                                if (log.objectData.digitizedImage) {
+                                    dbDeleteUploadedImage(log.objectData.digitizedImage);
+                                }
                                 const newObj = {
                                     ...log.objectData,
-                                    digitizedImage: base64Image,
+                                    digitizedImage: digitizedImageValue,
+                                    // The raw upload has served its purpose once
+                                    // digitized - delete it from the database so
+                                    // only the digitized copy remains, and the
+                                    // RAW button disappears from the table.
+                                    rawImage: null,
                                     logbookStatus: 'digitized'
                                 };
                                 await dbUpdateObject('logbook', logbookId, newObj);
@@ -1247,7 +1346,9 @@ const AdminDashboard = ({ onLogout }) => {
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-gray-100">
-                                            {applySearch(users.filter(u => !u.objectData.deleted), u => [u.objectData.fullName, u.objectData.regNumber, u.objectData.email]).length === 0 ? (
+                                            {(() => {
+                                                const filteredUsers = applySearch(users.filter(u => !u.objectData.deleted), u => [u.objectData.fullName, u.objectData.regNumber, u.objectData.email]);
+                                                return filteredUsers.length === 0 ? (
                                                 <tr>
                                                     <td colSpan="9" className="px-3 py-8 text-center text-gray-500">
                                                         <div className="flex flex-col items-center gap-2">
@@ -1257,7 +1358,7 @@ const AdminDashboard = ({ onLogout }) => {
                                                     </td>
                                                 </tr>
                                             ) : (
-                                                applySearch(users.filter(u => !u.objectData.deleted), u => [u.objectData.fullName, u.objectData.regNumber, u.objectData.email]).map((u, i) => (
+                                                paginate(filteredUsers, 'registeredUsers').map((u, i) => (
                                                     <tr key={i} className="hover:bg-blue-50/50 transition-colors cursor-pointer" onClick={() => setSelectedUserForDetails(u)}>
                                                         <td className="px-3 py-2">
                                                             <div className="w-8 h-8 rounded-full overflow-hidden border border-gray-200 shadow-sm bg-gray-100">
@@ -1294,10 +1395,12 @@ const AdminDashboard = ({ onLogout }) => {
                                                         </td>
                                                     </tr>
                                                 ))
-                                            )}
+                                            );
+                                            })()}
                                         </tbody>
                                     </table>
                                     </div>
+                                    <PaginationBar items={applySearch(users.filter(u => !u.objectData.deleted), u => [u.objectData.fullName, u.objectData.regNumber, u.objectData.email])} pageKey="registeredUsers" />
                                 </div>
                             </div>
                         </div>
@@ -1352,7 +1455,11 @@ const AdminDashboard = ({ onLogout }) => {
                                                                             for (const o of ordersToDelete) await dbDeleteObject('field_report_order', o.objectId);
                                                                             
                                                                             const logsToDelete = logbooks.filter(l => l.objectData.regNumber === regNumber);
-                                                                            for (const l of logsToDelete) await dbDeleteObject('logbook', l.objectId);
+                                                                            for (const l of logsToDelete) {
+                                                                                await dbDeleteObject('logbook', l.objectId);
+                                                                                if (l.objectData.rawImage) dbDeleteUploadedImage(l.objectData.rawImage);
+                                                                                if (l.objectData.digitizedImage) dbDeleteUploadedImage(l.objectData.digitizedImage);
+                                                                            }
                                                                             
                                                                             const reqsToDelete = passwordRequests.filter(r => r.objectData.regNumber === regNumber);
                                                                             for (const r of reqsToDelete) await dbDeleteObject('password_request', r.objectId);
@@ -1362,6 +1469,7 @@ const AdminDashboard = ({ onLogout }) => {
                                                                             for (const n of notifsToDelete) await dbDeleteObject('notification', n.objectId);
                                                                             
                                                                             await dbDeleteObject('user', u.objectId);
+                                                                            if (u.objectData?.photoUrl) dbDeleteUploadedImage(u.objectData.photoUrl);
                                                                             
                                                                             setUsers(users.filter(usr => usr.objectId !== u.objectId));
                                                                             setFieldOrders(fieldOrders.filter(o => o.objectData.regNumber !== regNumber));
@@ -1457,12 +1565,14 @@ const AdminDashboard = ({ onLogout }) => {
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-gray-100">
-                                            {applySearch(getOrdersWithUserDetails(o => o.objectData.status !== 'CANCELLED'), o => [o.userDetails.objectData?.fullName, o.objectData.regNumber, o.objectData.organizationName, o.objectData.paymentPhone, o.objectData.paymentName]).length === 0 ? (
+                                            {(() => {
+                                                const filteredOrders = applySearch(getOrdersWithUserDetails(o => o.objectData.status !== 'CANCELLED'), o => [o.userDetails.objectData?.fullName, o.objectData.regNumber, o.objectData.organizationName, o.objectData.paymentPhone, o.objectData.paymentName]);
+                                                return filteredOrders.length === 0 ? (
                                                 <tr>
                                                     <td colSpan="8" className="px-3 py-8 text-center text-gray-500">No field report orders at the moment.</td>
                                                 </tr>
                                             ) : (
-                                                applySearch(getOrdersWithUserDetails(o => o.objectData.status !== 'CANCELLED'), o => [o.userDetails.objectData?.fullName, o.objectData.regNumber, o.objectData.organizationName, o.objectData.paymentPhone, o.objectData.paymentName]).map((order, i) => (
+                                                paginate(filteredOrders, 'fieldReportOrders').map((order, i) => (
                                                     <tr key={i} className="hover:bg-blue-50/50 transition-colors cursor-pointer" onClick={() => setSelectedFieldOrderForDetails(order)}>
                                                         <td className="px-3 py-2">
                                                             <div className="w-8 h-8 rounded-full overflow-hidden border border-gray-200 shadow-sm bg-gray-100">
@@ -1495,10 +1605,12 @@ const AdminDashboard = ({ onLogout }) => {
                                                         </td>
                                                     </tr>
                                                 ))
-                                            )}
+                                            );
+                                            })()}
                                         </tbody>
                                     </table>
                                     </div>
+                                    <PaginationBar items={applySearch(getOrdersWithUserDetails(o => o.objectData.status !== 'CANCELLED'), o => [o.userDetails.objectData?.fullName, o.objectData.regNumber, o.objectData.organizationName, o.objectData.paymentPhone, o.objectData.paymentName])} pageKey="fieldReportOrders" />
                                 </div>
                             </div>
                         </div>
@@ -1523,12 +1635,14 @@ const AdminDashboard = ({ onLogout }) => {
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-gray-100">
-                                            {applySearch(getOrdersWithUserDetails(o => o.objectData.status !== 'CANCELLED'), o => [o.userDetails.objectData?.fullName, o.objectData.regNumber]).length === 0 ? (
+                                            {(() => {
+                                                const filteredLogOrders = applySearch(getOrdersWithUserDetails(o => o.objectData.status !== 'CANCELLED'), o => [o.userDetails.objectData?.fullName, o.objectData.regNumber]);
+                                                return filteredLogOrders.length === 0 ? (
                                                 <tr>
                                                     <td colSpan="10" className="px-3 py-8 text-center text-gray-500">No field orders available.</td>
                                                 </tr>
                                             ) : (
-                                                applySearch(getOrdersWithUserDetails(o => o.objectData.status !== 'CANCELLED'), o => [o.userDetails.objectData?.fullName, o.objectData.regNumber]).map((order, i) => {
+                                                paginate(filteredLogOrders, 'logbooks').map((order, i) => {
                                                     const orderLogbooks = logbooks.filter(l => l.objectData.orderId === order.objectId);
                                                     
                                                     return (
@@ -1554,34 +1668,37 @@ const AdminDashboard = ({ onLogout }) => {
                                                                         ) : (
                                                                             <div className="flex flex-col items-center gap-1.5">
                                                                                 <div className="flex items-center gap-1.5">
-                                                                                    <button 
-                                                                                        onClick={() => { if (checkAuth('viewing')) setViewingLogbook(log.objectData.rawImage); }}
-                                                                                        className="bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-200 px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm"
-                                                                                    >
-                                                                                        RAW
-                                                                                    </button>
-                                                                                    
                                                                                     {log.objectData.logbookStatus === 'digitized' ? (
                                                                                         <button 
                                                                                             onClick={() => { if (checkAuth('viewing')) setViewingLogbook(log.objectData.digitizedImage); }}
                                                                                             className="bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm flex items-center gap-1"
                                                                                         >
-                                                                                            <div className="icon-check"></div> DONE
-                                                                                        </button>
-                                                                                    ) : digitizingState[log.objectId] ? (
-                                                                                        <button 
-                                                                                            disabled
-                                                                                            className="bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded text-[9px] font-bold shadow-sm flex items-center gap-1"
-                                                                                        >
-                                                                                            <div className="icon-loader animate-spin text-[10px]"></div> PROC..
+                                                                                            <div className="icon-check"></div> DIGITIZED
                                                                                         </button>
                                                                                     ) : (
-                                                                                        <button 
-                                                                                            onClick={() => handleDigitizeUpload(log.objectId)}
-                                                                                            className="bg-[var(--primary-color)] text-white hover:bg-[var(--primary-dark)] px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm"
-                                                                                        >
-                                                                                            DIGITIZE
-                                                                                        </button>
+                                                                                        <>
+                                                                                            <button 
+                                                                                                onClick={() => { if (checkAuth('viewing')) setViewingLogbook(log.objectData.rawImage); }}
+                                                                                                className="bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-200 px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm"
+                                                                                            >
+                                                                                                RAW
+                                                                                            </button>
+                                                                                            {digitizingState[log.objectId] ? (
+                                                                                                <button 
+                                                                                                    disabled
+                                                                                                    className="bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded text-[9px] font-bold shadow-sm flex items-center gap-1"
+                                                                                                >
+                                                                                                    <div className="icon-loader animate-spin text-[10px]"></div> PROC..
+                                                                                                </button>
+                                                                                            ) : (
+                                                                                                <button 
+                                                                                                    onClick={() => handleDigitizeUpload(log.objectId)}
+                                                                                                    className="bg-[var(--primary-color)] text-white hover:bg-[var(--primary-dark)] px-2 py-0.5 rounded text-[9px] font-bold transition-colors shadow-sm"
+                                                                                                >
+                                                                                                    DIGITIZE
+                                                                                                </button>
+                                                                                            )}
+                                                                                        </>
                                                                                     )}
                                                                                 </div>
                                                                             </div>
@@ -1592,10 +1709,12 @@ const AdminDashboard = ({ onLogout }) => {
                                                         </tr>
                                                     );
                                                 })
-                                            )}
+                                            );
+                                            })()}
                                         </tbody>
                                     </table>
                                     </div>
+                                    <PaginationBar items={applySearch(getOrdersWithUserDetails(o => o.objectData.status !== 'CANCELLED'), o => [o.userDetails.objectData?.fullName, o.objectData.regNumber])} pageKey="logbooks" />
                                 </div>
                             </div>
                         </div>

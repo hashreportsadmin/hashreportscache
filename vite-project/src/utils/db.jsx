@@ -95,6 +95,64 @@ export const dbDeleteObject = async (objectType, objectId) => {
     if (error) { console.error('Supabase Delete Error:', error); throw error; }
 };
 
+// Converts a base64 data URL (e.g. "data:image/webp;base64,...") into a Blob
+// for upload, without needing a fetch() round trip to decode it.
+const dataUrlToBlob = (dataUrl) => {
+    const [header, base64] = dataUrl.split(',');
+    const mimeMatch = header.match(/data:(.*?);base64/);
+    const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+};
+
+// Uploads a base64 image to Supabase Storage instead of storing it inline in
+// a database row, and returns its public URL. Storing a short URL string in
+// objectdata instead of a multi-hundred-KB base64 string is what actually
+// fixes database egress: every future query that reads this row (including
+// ones that don't even need the image) stops dragging the image bytes along
+// with it every single time.
+//
+// This requires a public Storage bucket named "app-images" to already exist
+// in the Supabase project (Storage tab -> New bucket -> Public). If it
+// doesn't exist yet, or the upload fails for any reason, this throws so the
+// caller can fall back to the previous inline-base64 behavior rather than
+// breaking the feature entirely.
+export const dbUploadImage = async (folder, base64DataUrl) => {
+    if (!base64DataUrl || !base64DataUrl.startsWith('data:image')) {
+        return base64DataUrl; // already a URL (or empty) - nothing to do
+    }
+    const blob = dataUrlToBlob(base64DataUrl);
+    const ext = blob.type.split('/')[1] || 'jpg';
+    const path = `${folder}/${generateId()}.${ext}`;
+    const { error: uploadError } = await supabaseClient.storage
+        .from('app-images')
+        .upload(path, blob, { contentType: blob.type, upsert: false });
+    if (uploadError) {
+        console.error('Supabase Storage Upload Error:', uploadError);
+        throw uploadError;
+    }
+    const { data } = supabaseClient.storage.from('app-images').getPublicUrl(path);
+    return data.publicUrl;
+};
+
+// Deletes a previously uploaded Storage image given its public URL. Safe to
+// call with a base64 string, an empty value, or a URL from a different
+// bucket - it silently does nothing unless the URL is actually one of ours.
+export const dbDeleteUploadedImage = async (publicUrl) => {
+    if (!publicUrl || typeof publicUrl !== 'string') return;
+    const marker = '/storage/v1/object/public/app-images/';
+    const idx = publicUrl.indexOf(marker);
+    if (idx === -1) return; // not one of our Storage URLs (e.g. still base64, or already null)
+    const path = publicUrl.slice(idx + marker.length);
+    try {
+        await supabaseClient.storage.from('app-images').remove([path]);
+    } catch (e) {
+        console.error('Supabase Storage Delete Error:', e);
+    }
+};
+
 export const calculateOrderProgress = (orderData, orderId, logbooksList) => {
     let completed = 0;
     let total = 55;
